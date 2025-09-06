@@ -1,0 +1,86 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Become a Camera</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Arial; display:flex; flex-direction:column; align-items:center; padding:20px; }
+    video { width: 320px; height: auto; border-radius:8px; background:black; }
+    #status { margin-top:8px; font-size:14px; }
+  </style>
+</head>
+<body>
+  <h2>This page will share your camera</h2>
+  <video id="local" autoplay playsinline muted></video>
+  <div id="status">Not connected</div>
+
+  <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+  <script>
+    // <<< CONFIGURE THIS to your signaling server URL >>>
+    const SIGNALING_SERVER = "secruitycameracamera.duckdns.org";
+    const socket = io(SIGNALING_SERVER, { transports: ['websocket'] });
+    const status = document.getElementById('status');
+    const localVideo = document.getElementById('local');
+
+    let localStream = null;
+    let pcs = {}; // viewerId -> RTCPeerConnection
+
+    async function init() {
+      try {
+        localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+        localVideo.srcObject = localStream;
+        status.textContent = 'Camera active. Connecting to signaling...';
+      } catch (e) {
+        console.error('getUserMedia failed', e);
+        status.textContent = 'Camera permission denied or no camera.';
+        return;
+      }
+
+      socket.on('connect', () => {
+        status.textContent = 'Connected to signaling server. Registering as camera...';
+        socket.emit('register-camera', { name: (navigator.userAgent.split(')')[0] || 'browser') });
+      });
+
+      socket.on('viewer-offer', async ({ offer, viewerId }) => {
+        // viewer wants to view: viewer created offer, we must answer
+        const pc = new RTCPeerConnection();
+
+        // add local tracks
+        localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+
+        pc.onicecandidate = (ev) => {
+          if (ev.candidate) {
+            socket.emit('ice-candidate', { targetId: viewerId, candidate: ev.candidate });
+          }
+        };
+
+        // handle possible data channel
+        pc.ondatachannel = (ev) => {
+          const ch = ev.channel;
+          ch.onmessage = e => console.log('data from viewer', e.data);
+        };
+
+        await pc.setRemoteDescription(new RTCSessionDescription(offer));
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+
+        // store pc
+        pcs[viewerId] = pc;
+
+        // send answer back
+        socket.emit('camera-answer', { targetViewerId: viewerId, answer: pc.localDescription });
+      });
+
+      // incoming ICE candidates from viewers
+      socket.on('ice-candidate', ({ fromId, candidate }) => {
+        const pc = pcs[fromId];
+        if (pc) pc.addIceCandidate(new RTCIceCandidate(candidate)).catch(e => console.warn(e));
+      });
+
+      socket.on('disconnect', () => status.textContent = 'Disconnected from signaling server.');
+    }
+
+    init();
+  </script>
+</body>
+</html>
